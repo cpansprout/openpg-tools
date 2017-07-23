@@ -1,0 +1,14 @@
+This repository contains various bits and pieces that I am using that
+have to do with the Open PG project, which has its data files at
+<https://github.com/OGL-PatrologiaGraecaDev>.
+
+align_pages
+
+  A script for figuring out which pages in multiple copies of a vol-
+  ume are actually the same page.  See the comments at the top of the
+  script for details.
+
+pages.json
+
+  The output of align_pages, the format of which is described in
+  align_pages.
