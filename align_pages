@@ -1,0 +1,204 @@
+#!/usr/bin/perl
+
+# Run the script in its own directory as follows:
+#
+#    perl align_pages
+#
+# (You need to have the String::Similarity module installed first, which
+# will install without hiccoughs on most Unix systems via:
+#
+#    cpan String::Similarity
+#
+# at the command line, so long as you have a C compiler.)
+#
+# This script goes through each volume of the PG and aligns the pages based
+# on which somewhat arbitrarily chosen pages ‘look’ the most similar.
+#
+# The OGL_PatrologiaGraecaDev repositories must exist in the file system in
+# the location specified by the OGL_PG_DEV environment variable or the
+# $ogl_pg_dev variable below.  The files do not need to be checked out.
+# (You can clone with ‘git clone -n’.)
+#
+# The output will be dumped to the file pages.json in a format somewhat
+# like this:
+#  { "Vol.-1": {
+#          "coo.31924054872803_ocr" : [ 40, .398472398472398472 ]
+#          "hvd.32044015466733"     : [ 50, .998789327492387432 ]
+#          "hvd.32044015466733_ocr" : [ 43, .872394873298473298 ]
+#           ...
+#     },
+#    "Vol.-2": {
+#           ...
+#     },
+#     ...
+#  }
+#
+# In this example, pages 40, 50, and 43, in their respective folders, are
+# the same page.  The second number in each array is the similarity score
+# Very low similarity scores indicate a mismatch, which will have to be
+# solved manually.  (Sometimes it is a PL instead of a PG volume.)
+#
+# Since it takes a very long time to run, it will read the file pages.json,
+# if it exists, and skip any volumes already contained in the file.  It
+# will output the file after every volume.  This means that you can inter-
+# rupt it and run it later.  It also means that any manual changes will
+# be retained.
+
+$ogl_pg_dev = $ENV{OGL_PG_DEV} || "/Volumes/Fridge/PG/";
+
+# ---------------------------------------------------------------------- #
+
+if (open f, "pages.json") {
+ local $/; 
+ my $results = <f>;
+ $results =~ s/:/=>/g; # Convert from JSON to Perl (not fool-proof, I know,
+ %results = %{ eval "+$results" };  # but probably good enough).
+}
+close f;
+
+opendir d, $ogl_pg_dev, or die "Cannot read the $ogl_pg_dev directory: $!";
+@voles = grep { !/^\./ and -d "$ogl_pg_dev$_"} readdir d;
+closedir d;
+
+for $vole (@voles) {
+ next if exists $results{$vole};
+ chomp(
+  my @files = `cd \Q$ogl_pg_dev$vole\E; git ls-tree -r --name-only HEAD`
+ );
+ my %copies;
+ for (@files) {
+  next unless /\.(?:txt|html)\z/;
+  next unless y|/|| == 1;
+  my($copy,$file) = split '/';
+  push @{ $copies{$copy} }, $file;
+ }
+ # Delete any folders with too few files (probably not actually copies).
+ for (keys %copies) {
+  delete $copies{$_} if @{$copies{$_}} < 400; # somewhat arbitrary number
+ }
+ my @copies = keys %copies;
+ my %vole_results;
+ my $copies_found;
+ my $overall_score;
+
+ # Let’s arbitrarily start with page 50 and see how it works.  Try
+ # up to 100 pages.  The reason for trying more than one page is
+ # that the similarity algorithm can easily be fooled when an
+ # OCR scan contains only one column from a two-column page (e.g.,
+ # Vol.-1/hvd.32044054121090_ocr/061.txt) while at the same time another
+ # copy contains both columns (e.g., 
+ #    Vol.-1/2014-09-17-07-16_migne-njp-2014-09-03-08-28-00072100.pyrnn.gz_raw_hocr_output/njpPERIOD32101077772331_0089.html
+ # ).  The similarity function does not find them very similar at all
+ # (about .37) and will pick a different page that happens to have a
+ # slightly higher, but still low, score, such as .48.  So we need to
+ # try multiple pages until we find one that has the most copies with
+ # scores > .8.  (Still, this is not good enough, so we try to solve the
+ # single-column problem a different way below.  It may seem redundant,
+ # but, hey, it works [for Vol. 1 at least].)
+
+ PAGE: for my $page_no(49..149) {
+warn "$vole: Trying page ",$page_no+1, "...\n";
+  use Unicode'Normalize;
+  # Use NFKD so that the accents get separated from the Greek characters,
+  # to increase the chance of finding similarities.
+  my $content =
+    NFKD read_file($vole, "$copies[0]/$copies{$copies[0]}[$page_no]");
+  next unless length $content;
+
+  my %potential_vole_results;
+  $potential_vole_results{$copies[0]} =
+    [
+      ( $copies{$copies[0]}[$page_no]
+           =~ /([1-9][0-9]*)[^0-9]*\z/ )[0],
+      1, # similarity of 1 (hey, it’s identical!)
+    ];
+
+  # Search through the other copies
+  COPY:
+  for my $copy (@copies[1..$#copies]) {
+   my $similarity = 0;
+
+   # Try up to forty pages ahead and behind (yes, sometimes we need that
+   # many, surprisingly enough).
+   for my $page_adjust (0, map +($_, -$_), 1...40) { # 0, 1, -1, 2, -2 ...
+    my $content2 =
+     NFKD read_file($vole, "$copy/$copies{$copy}[$page_no+$page_adjust]");
+    next unless length $content2;
+
+    use String::Similarity;
+    my $s = similarity $content, $content2, $similarity;
+    # Sometimes one scan will be missing the second column, resulting in a
+    # very low similarity (even to the point that some other page will get
+    # a slightly higher similarity).  So if one string is more than 30%
+    # longer than the other, chop the longer one in half and try comparing
+    # just half a page at a time, to see if we can get a better similarity.
+    my($l1,$l2) = sort { $a <=> $b } length $content, length $content2;
+    if ($l2 / $l1 >= 1.3) {
+     my ($c1,$c2) = sort { length $a <=> length $b } $content, $content2;
+     my $s1 = similarity $c1, substr($c2,0,$l2/2), $similarity;
+     my $s2 = similarity $c1, substr($c2,  $l2/2), $similarity;
+     $s = $s1 if $s1 > $s;
+     $s = $s2 if $s2 > $s;
+    }
+    if ($s > $similarity) {
+     $similarity = $s;
+     $potential_vole_results{$copy} =
+      [
+       ( $copies{$copy}[$page_no+$page_adjust]
+           =~ /([1-9][0-9]*)[^0-9]*\z/ )[0],
+       $similarity
+      ];
+     if ($s > .9) { # If it is this close, then we have definitely found
+       next COPY;   # it.  We can skip the rest of the pages we were going
+     }              # to try.
+    }
+   }
+  }
+
+  my $cf = 0;
+  my $os = 0;
+  for my $data (values %potential_vole_results) {
+   if ($$data[1] > .8) { # This is the similarity
+    $cf++
+   }
+   $os += $$data[1]
+  }
+  if ($cf > $copies_found or $cf == $copies_found && $os > $overall_score){
+   $copies_found = $cf;
+   $overall_score = $os;
+   %vole_results = %potential_vole_results;
+  }
+  warn " Copies found for this page: $cf (score $os).\n";
+  last if $cf == @copies;
+ }
+ $results{$vole} = \%vole_results;
+ open my $fh,">pages.json" or die "Cannot open pages.json for writing: $!";
+ # Hand-rolled JSON, since all the libraries produce squashed JSON, and we
+ # want something hand-editable.
+ select +(select($fh), do {
+  print "{\n";
+  my @voles = sort keys %results;
+  my $lastv = $voles[-1];
+  for my $vole (@voles) {
+   print qq'    "$vole": {\n';
+   my @copies = sort keys % { $results{$vole} };
+   my $last = $copies[-1];
+   for my $copy (@copies) {
+    print qq'        "$copy": ['
+         .qq'$results{$vole}{$copy}[0], $results{$vole}{$copy}[1]]'
+         . ','x($last ne $copy) . "\n";
+   }
+   print "    }" . ','x($lastv ne $vole) . "\n";
+  }
+  print "}\n";
+ })[0];
+ close $fh or die "Error closing pages.json: $!";
+}
+
+sub read_file {
+ my ($vole,$fn) = @_;
+ my $content = `cd \Q$ogl_pg_dev$vole\E; git show HEAD:$fn`;
+ $fn =~ /\.html\z/ and $content =~ s/<[^>]+>//g;
+ utf8'decode $content;
+ $content;
+}
