@@ -1,0 +1,47 @@
+#!/usr/bin/perl
+
+# Run the script in its own directory as follows:
+#
+#    perl char-counter
+#
+# This script goes through each volume of the PG and compiles a list of
+# all characters that occur in any HTML or text file.  Characters are first
+# decomposed, so instead of having fifty different kinds of alpha, we have
+# one alpha and an array of accents.
+#
+# The output is saved in Data::Dumper’s ‘Useqq’ format, as a simple array
+# of characters.  The file name is ‘chars.dd’.
+#
+# The OGL_PatrologiaGraecaDev repositories must exist in the file system in
+# the location specified by the OGL_PG_DEV environment variable or the
+# $ogl_pg_dev variable below.  The files do not need to be checked out.
+# (You can clone with ‘git clone -n’.)
+
+$ogl_pg_dev = $ENV{OGL_PG_DEV} || "/Volumes/Fridge/PG/";
+
+opendir d, $ogl_pg_dev, or die "Cannot read the $ogl_pg_dev directory: $!";
+@voles = grep { !/^\./ and -d "$ogl_pg_dev$_"} readdir d;
+closedir d;
+
+for $vole (@voles) {
+ chomp(
+  my @files = `cd \Q$ogl_pg_dev$vole\E; git ls-tree -r --name-only HEAD`
+ );
+ for (@files) {
+  next unless /\.(?:txt|html)\z/;
+  next unless y|/|| == 1;
+  my $content = `cd \Q$ogl_pg_dev$vole\E; git show HEAD:$_`;
+  utf8'decode $content;
+  use Unicode'Normalize;
+  for (split //, NFD $content) {
+   ++ $seen{$_}
+  }
+ }
+}
+
+use Data'Dumper;
+$Data::Dumper::Useqq++;
+$Data'Dumper'Terse++;
+open f, ">chars.dd" or die "Cannot open chars.dd for writing: $!";
+print f Dumper [sort keys %seen];
+close f or "Error closing chars.dd: $!";
